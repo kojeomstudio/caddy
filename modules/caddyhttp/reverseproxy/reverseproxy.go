@@ -699,9 +699,15 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 
 	// proxy the request to that upstream
 	proxyErr = h.reverseProxy(w, r, origReq, repl, dialInfo, next)
-	if proxyErr == nil || errors.Is(proxyErr, context.Canceled) {
-		// context.Canceled happens when the downstream client
-		// cancels the request, which is not our failure
+	if proxyErr == nil {
+		return true, nil
+	}
+	if errors.Is(proxyErr, context.Canceled) {
+		// context.Canceled happens when the downstream client cancels the
+		// request, which is not our failure; don't retry or ding the upstream.
+		// Record a 499 (client closed request) so the access log reflects the
+		// disconnect instead of a misleading 0 status (see #7396).
+		w.WriteHeader(499)
 		return true, nil
 	}
 
@@ -1215,18 +1221,28 @@ func (h *Handler) finalizeResponse(
 	start time.Time,
 	logger *zap.Logger,
 ) error {
+	// Strip hop-by-hop headers from the upstream response.
+	// For 101 Switching Protocols, save the Upgrade value
+	// first (handleUpgradeResponse needs it for validation)
+	// and restore it with a canonical Connection header.
+	upgradeVal := res.Header.Get("Upgrade")
+
+	removeConnectionHeaders(res.Header)
+	for _, h := range hopHeaders {
+		res.Header.Del(h)
+	}
+
+	if res.StatusCode == http.StatusSwitchingProtocols && upgradeVal != "" {
+		res.Header.Set("Upgrade", upgradeVal)
+		res.Header.Set("Connection", "Upgrade")
+	}
+
 	// deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 	if res.StatusCode == http.StatusSwitchingProtocols {
 		var wg sync.WaitGroup
 		h.handleUpgradeResponse(logger, &wg, rw, req, res)
 		wg.Wait()
 		return nil
-	}
-
-	removeConnectionHeaders(res.Header)
-
-	for _, h := range hopHeaders {
-		res.Header.Del(h)
 	}
 
 	// delete our Server header and use Via instead (see #6275)
